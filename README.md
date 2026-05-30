@@ -48,7 +48,7 @@
                    │   交换机   │
                    └─────┬─────┘
                          │
-             播放器 / 客户端（TiviMate · VLC · Kodi）
+             播放器 / 客户端（APTV · VLC · Kodi）
 ```
 
 - **主路由**：上联光猫互联网口，负责家庭 LAN 与上网。
@@ -111,9 +111,22 @@ uv run generate_m3u.py --probe    # 同时探测编码（较慢）
 | `user_token` | 用户令牌 |
 | `stb_type` / `stb_version` | 机顶盒型号 / 固件版本 |
 
+### 如何抓到这些字段
+
+机顶盒开机时会向运营商的 EPG / 认证服务器发一个 HTTP POST 完成鉴权，上面这些字段就在那个请求里。恩山无线论坛也有不少 IPTV 抓包 / 认证分析讨论，例如「[广东电信 IPTV 验证过程分析、直播源提取、openwrt 单线复用、RTSP 代理](https://www.right.com.cn/forum/thread-8237625-1-1.html)」；各省份 / 平台差异很大，下面只抽象通用思路，不直接套用某个固定接口。
+
+思路是**在机顶盒与上游之间把这次请求截下来**：
+
+1. **选抓包点**：机顶盒所连的那台路由（OpenWrt / iStoreOS 等）就是天然的抓包位置——它本就在机顶盒与认证服务器的链路上，可在其上抓流量；也可用交换机端口镜像把机顶盒口的流量复制出来分析。
+2. **触发认证**：重启机顶盒，让它重新走一遍开机鉴权（认证令牌有时效，抓的就是这一刻发出的请求）。
+3. **定位请求**：在抓包结果里找发往 EPG / 认证服务器的 **HTTP POST**（表单里能看到 `UserID`、`Authenticator`、`STBID`、`MAC` 等键名），各运营商 / 平台的接口路径不尽相同，按抓到的实际请求为准。
+4. **对应到配置**：把 POST 表单里的值按上表填进 `config.yaml` 对应字段即可。`iptv_account` 填完整账号（POST 里的 `NetUserID` / `DHCPUserID` 即「账号@账号域」形式）。
+
+> `authenticator` 等令牌有时效，过期后认证会失败，届时按上述步骤重新抓一次刷新即可。
+
 ## 播放器
 
-生成的 M3U 兼容 VLC、PotPlayer、TiviMate、Kodi（PVR IPTV Simple Client）等。直播经 rtp2httpd 转 HTTP 单播 + FCC 秒切；支持 catchup 的播放器可回看时移。
+生成的 M3U 兼容 VLC、PotPlayer、TiviMate、Kodi（PVR IPTV Simple Client）、APTV 等。直播经 rtp2httpd 转 HTTP 单播 + FCC 秒切；支持 catchup 的播放器可回看时移。
 
 ## 定时更新
 
