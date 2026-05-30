@@ -1,0 +1,44 @@
+# IPTV M3U 播放列表生成器配置文件
+#
+# 使用前：cp config.example.yaml config.yaml.local，然后填入你自己机顶盒的认证信息。
+# config.yaml.local（以及 config.yaml）已被 .gitignore 忽略，不会被提交。
+# 加载优先级：config.yaml.local > config.yaml
+
+# EPG 分类页 URL（每个 URL 对应一个分组）
+epg_urls:
+  - url: "https://epg.51zmt.top:8001/category/cctv/"
+    group: "央视"
+  - url: "https://epg.51zmt.top:8001/category/satellite/"
+    group: "卫视"
+  - url: "https://epg.51zmt.top:8001/category/digital/"
+    group: "数字付费"
+  - url: "https://epg.51zmt.top:8001/category/local/广东/"
+    group: "广东"
+
+# rtp2httpd 服务地址（IGMP 转 HTTP 单播，支持 FCC 快速换台）
+unicast_url: "http://192.168.50.8:5140/rtp/"
+
+# 缓存目录
+cache_dir: "cache"
+
+# 输出目录（iStoreOS uhttpd web 根，HTTP 直接可访问）
+output_dir: "/www"
+
+# IPTV 认证配置（从你自己的机顶盒抓包获取，详见 README 的"获取认证信息"）
+auth:
+  # 用户 ID（通常为宽带账号）
+  user_id: "YOUR_USER_ID"
+  # 机顶盒 ID
+  stb_id: "YOUR_STB_ID"
+  # MAC 地址
+  mac: "AA:BB:CC:DD:EE:FF"
+  # 认证令牌（具有时效性，过期需重新获取）
+  authenticator: "YOUR_AUTHENTICATOR_TOKEN"
+  # 机顶盒型号（按你的机顶盒实际型号填写）
+  stb_type: "UNP-SJA5"
+  # 系统版本
+  stb_version: "1.1.0-UNIONMAN_UNP-SJA5.2024v1"
+  # 用户令牌
+  user_token: "YOUR_USER_TOKEN"
+  # 是否智能机顶盒
+  is_smart_stb: 0
