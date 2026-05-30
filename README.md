@@ -20,6 +20,58 @@
 - 运行在能访问 IPTV 内网的设备上（如旁路由 / 拨入 IPTV 大内网的 OpenWrt）
 - [rtp2httpd](https://github.com/stackia/rtp2httpd)：将 IGMP 组播转 HTTP 单播，并提供 FCC / catchup 代理
 
+## 网络拓扑
+
+整套方案有三个关键节点：**光猫**（ONT，通常一口走互联网、一口走 IPTV 组播）、**主路由**（家庭网关 / NAT）、**IPTV 路由**（运行 iStoreOS，本项目与 rtp2httpd 都跑在这里）。
+
+### 物理接线
+
+```
+                    运营商 ISP
+              （互联网 + IPTV 组播源）
+                        │ 光纤
+                  ┌─────┴─────┐
+                  │    光猫     │  ONT（互联网口 + IPTV 口）
+                  └──┬──────┬──┘
+          互联网口 ───┘      └─── IPTV 口
+                │                    │ PPPoE 拨入
+         ┌──────┴──────┐     ┌───────┴────────┐
+         │    主路由     │     │    IPTV 路由    │
+         │   网关 / NAT  │     │   (iStoreOS)   │
+         └──────┬──────┘     │   · rtp2httpd  │
+                │            │   · iptv2m3u   │
+                │            └───────┬────────┘
+                │                    │
+                └────────┬───────────┘
+                         │  家庭 LAN
+                   ┌─────┴─────┐
+                   │   交换机    │
+                   └─────┬─────┘
+                         │
+             播放器 / 客户端（TiviMate · VLC · Kodi）
+```
+
+- **主路由**：上联光猫互联网口，负责家庭 LAN 与上网。
+- **IPTV 路由（iStoreOS）**：WAN 口经光猫 IPTV 口 **PPPoE 拨入运营商 IPTV 大内网**；LAN 口并入家庭网络。组播转单播、FCC 秒切、catchup 回看、M3U 生成全在这台上完成。本机对互联网的访问（拉 EPG 等）走主路由。
+
+### 数据流
+
+```
+直播媒体流:
+  IPTV 组播源 ──PPPoE / IGMP──▶ IPTV 路由：rtp2httpd
+                                （组播 → HTTP 单播 + FCC 秒切 + catchup）
+                                       │ HTTP 单播
+                                       ▼
+                                  播放器 / 客户端
+
+播放列表生成（本项目）:
+  iptv2m3u ──认证──▶ IPTV EPG 服务器 ──▶ 拉频道列表 / 探测编码 / 匹配 EPG
+       │
+       └──▶ 生成 M3U ──写入──▶ uhttpd web 根 ──HTTP 订阅──▶ 播放器
+```
+
+> 媒体流与控制流分离：组播经 `rtp2httpd` 在 IPTV 路由本地转成 HTTP 单播下发，播放器只需订阅 IPTV 路由上的一个 HTTP 地址即可。
+
 ## 快速开始
 
 ```bash
