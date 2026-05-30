@@ -26,8 +26,10 @@ output_dir: "/www"
 
 # IPTV 认证配置（从你自己的机顶盒抓包获取，详见 README 的"获取认证信息"）
 auth:
-  # 用户 ID（通常为宽带账号）
-  user_id: "YOUR_USER_ID"
+  # 完整 IPTV 账号 = 宽带号 @ 账号域（认证域）；如广东电信为 07623024411@iptv.gd
+  # 账号域（@ 后那段，PPPoE/RADIUS 的 realm）各地区/运营商不同，按你的实际账号填
+  # 代码自动取 @ 前作 UserID、用完整值作 NetUserID/DHCPUserID
+  iptv_account: "YOUR_ACCOUNT@iptv.gd"
   # 机顶盒 ID
   stb_id: "YOUR_STB_ID"
   # MAC 地址

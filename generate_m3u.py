@@ -364,12 +364,14 @@ class GenM3U:
 
         # 认证表单数据
         auth = cfg["auth"]
-        uid = auth["user_id"]
+        account = auth["iptv_account"]          # 完整 IPTV 账号，如 07623024411@iptv.gd
+        bare_id = account.partition("@")[0]     # @ 前 → UserID（裸号）
+        net_id = account.replace("@", "%40")    # 完整账号 URL 编码 → NetUserID/DHCPUserID
         ver = auth.get("stb_version", "1.1.0-UNIONMAN_UNP-SJA5.2024v1")
         self._auth_form_data = (
-            f"UserID={uid}&Lang=&SupportHD=1&"
-            f"NetUserID={uid}%40iptv.gd&"
-            f"DHCPUserID={uid}%40iptv.gd&"
+            f"UserID={bare_id}&Lang=&SupportHD=1&"
+            f"NetUserID={net_id}&"
+            f"DHCPUserID={net_id}&"
             f"Authenticator={auth['authenticator']}&"
             f"STBType={auth.get('stb_type', 'UNP-SJA5')}&"
             f"STBVersion={ver}&conntype=&"

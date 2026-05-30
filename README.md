@@ -104,7 +104,7 @@ uv run generate_m3u.py --probe    # 同时探测编码（较慢）
 
 | 字段 | 说明 |
 |------|------|
-| `user_id` | 用户 ID（通常为宽带账号） |
+| `iptv_account` | 完整 IPTV 账号（含账号域，如 `07623024411@iptv.gd`） |
 | `stb_id` | 机顶盒硬件 ID |
 | `mac` | 机顶盒 MAC 地址 |
 | `authenticator` | 认证令牌（**有时效，过期需重新获取**） |
