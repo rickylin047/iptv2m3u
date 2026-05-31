@@ -98,7 +98,8 @@ def test_generate_m3u_structure():
     """端到端（离线）跑 _generate_m3u，核对表头/主源/RTSP直播/RTSP回看 结构。"""
     # CCTV-1：有 RTSP，应出现在主源 + RTSP直播 + RTSP回看
     ch1 = IPTVChannel(
-        channel_id="1", channel_name="CCTV-1综合高清", user_channel_id="101",
+        channel_id="1", channel_name="CCTV-1综合高清",
+        user_channel_id="101",
         igmp_url="igmp://239.3.1.1:8000", rtsp_url=SAMPLE_RTSP,
         fcc_enable=True, fcc_ip="125.88.60.1", fcc_port="8027",
     )
@@ -120,8 +121,8 @@ def test_generate_m3u_structure():
         g._generate_m3u(channels, epg, codec_map)
         with open(g.m3u_stream_path, encoding="utf-8-sig") as f:
             m3u = f.read()
-        with open(g.m3u_playback_path, encoding="utf-8-sig") as f:
-            playback = f.read()
+        with open(g.m3u_playback_path, encoding="utf-8-sig") as fp:
+            playback = fp.read()
 
     lines = m3u.splitlines()
 
@@ -132,19 +133,28 @@ def test_generate_m3u_structure():
     # ② 主组播：tvg-id 用 51zmt 码 CCTV1，URL 是组播 /rtp/ + FCC，
     #    catchup-source 走 rtp2httpd /rtsp/ + playseek
     assert 'tvg-id="CCTV1"' in m3u
-    # tvg-name 也对齐 51zmt 码（按 display-name 匹配 XMLTV），但可见名仍是运营商 CCTV-1
-    cctv1_main = [ln for ln in lines if 'group-title="央视"' in ln and 'tvg-id="CCTV1"' in ln]
+    # tvg-name 也对齐 51zmt 码（按 display-name 匹配 XMLTV），可见名仍是运营商 CCTV-1
+    cctv1_main = [
+        ln for ln in lines
+        if 'group-title="央视"' in ln and 'tvg-id="CCTV1"' in ln
+    ]
     assert cctv1_main, "未找到 CCTV1 主组播条目"
     assert all('tvg-name="CCTV1"' in ln for ln in cctv1_main), cctv1_main
     assert all(ln.endswith(",CCTV-1") for ln in cctv1_main), cctv1_main
-    assert "http://192.168.50.8:5140/rtp/239.3.1.1:8000?fcc=125.88.60.1:8027&fcc-type=huawei" in m3u
+    assert (
+        "http://192.168.50.8:5140/rtp/239.3.1.1:8000"
+        "?fcc=125.88.60.1:8027&fcc-type=huawei"
+    ) in m3u
     assert ('catchup-source="http://192.168.50.8:5140/rtsp/125.88.55.199/'
             "PLTV/88888888/224/3221225618/index.smil?accountinfo="
             "FAKEAUTH0123456789ABCDEF&playseek={utc:YmdHMS}-{utcend:YmdHMS}\"") in m3u
 
     # ③ CCTV-2 无 RTSP：主源在、tvg-id=CCTV2、但该条无 catchup-source
     assert 'tvg-id="CCTV2"' in m3u
-    cctv2_main = [ln for ln in lines if 'tvg-id="CCTV2"' in ln and 'group-title="央视"' in ln]
+    cctv2_main = [
+        ln for ln in lines
+        if 'tvg-id="CCTV2"' in ln and 'group-title="央视"' in ln
+    ]
     assert cctv2_main and all("catchup-source=" not in ln for ln in cctv2_main), cctv2_main
 
     # ④ RTSP直播：仅 CCTV1 一条；该 #EXTINF 行无 tvg-id；名带 [RTSP]
