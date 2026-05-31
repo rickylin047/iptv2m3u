@@ -15,6 +15,13 @@ epg_urls:
   - url: "https://epg.51zmt.top:8001/category/local/广东/"
     group: "广东"
 
+# 节目单 XMLTV（写进 M3U 表头 x-tvg-url，给播放器显示 EPG 节目表 / 从节目单选节目回看）。
+# 默认 51zmt 的 e.xml.gz：与上面分类页台标同源、每日更新；频道按 51zmt 频道码（写入
+# tvg-id / tvg-name）绑定。注意 51zmt XMLTV 的 <channel id> 是数字序号、<display-name>
+# 才是频道码（CCTV1 / 湖南卫视…），靠 display-name 匹配，所以播放器需能联网拉 EPG。
+# 一般无需修改；如需自定义可取消下一行注释覆盖：
+# epg_xmltv_url: "http://epg.51zmt.top:8000/e.xml.gz"
+
 # rtp2httpd 服务地址（IGMP 转 HTTP 单播，支持 FCC 快速换台）
 unicast_url: "http://192.168.50.8:5140/rtp/"
 

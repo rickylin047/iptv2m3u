@@ -358,6 +358,12 @@ class GenM3U:
             raise ValueError("配置文件为空")
 
         self.epg_urls: list[dict[str, str]] = cfg["epg_urls"]
+        # 节目单 XMLTV 地址（写进 M3U 表头 x-tvg-url，给播放器显示 EPG 节目表）。
+        # 默认用 51zmt 的 e.xml.gz：与频道台标/分类页同源、每日更新，频道按
+        # 51zmt 频道码（即 tvg-id）精确绑定。一般无需改，可在 config 覆盖。
+        self.epg_xmltv_url: str = cfg.get(
+            "epg_xmltv_url", "http://epg.51zmt.top:8000/e.xml.gz",
+        )
         self.unicast_url: str = cfg["unicast_url"]                       # .../rtp/
         # RTSP 直播备用源 relay 基址：默认把 unicast_url 末段 rtp/ 换成 rtsp/
         # （同一 rtp2httpd 服务）。可在 config 显式覆盖 rtsp_url，默认无需配置。
@@ -656,14 +662,19 @@ class GenM3U:
         base_name: str,
         channel_name: str,
         epg_index: dict[str, EPGChannel],
-    ) -> tuple[str, str]:
-        """三级匹配: 精确 → 忽略大小写 → 高阈值模糊 → fallback。"""
+    ) -> tuple[str, str, str]:
+        """三级匹配: 精确 → 忽略大小写 → 高阈值模糊 → fallback。
+
+        返回 (tvg_logo, group_title, epg_id)。epg_id = 命中 EPG 频道的 tvg_name，
+        即 51zmt 频道码（如 CCTV1 / HunanTV），与节目单 XMLTV 的 <channel id>
+        同一套编码，用作 tvg-id 精确绑定节目单；未命中返回 ""。
+        """
         # ① 精确匹配（覆盖 90%+ 的频道）
         ch = epg_index.get(base_name)
         if ch:
             log.info("频道 '%s' → '%s' [精确]  分类=%s",
                      channel_name, ch.tvg_name, ch.group_title)
-            return ch.tvg_logo, ch.group_title
+            return ch.tvg_logo, ch.group_title, ch.tvg_name
 
         # ② 忽略大小写（处理 cctv/CCTV 等差异）
         lower = base_name.lower()
@@ -671,7 +682,7 @@ class GenM3U:
             if key.lower() == lower:
                 log.info("频道 '%s' → '%s' [忽略大小写]  分类=%s",
                          channel_name, ch.tvg_name, ch.group_title)
-                return ch.tvg_logo, ch.group_title
+                return ch.tvg_logo, ch.group_title, ch.tvg_name
 
         # ③ 高阈值模糊匹配（仅处理小差异，如 纪录/记录）
         keys = list(epg_index.keys())
@@ -681,12 +692,12 @@ class GenM3U:
             log.info("频道 '%s' → '%s' [模糊 %.0f%%]  分类=%s",
                      channel_name, ch.tvg_name,
                      _similarity(base_name, matches[0]) * 100, ch.group_title)
-            return ch.tvg_logo, ch.group_title
+            return ch.tvg_logo, ch.group_title, ch.tvg_name
 
         # ④ fallback: 按频道名关键词猜分组
         group = self._guess_group(channel_name)
         log.debug("频道 '%s' 未匹配 EPG → fallback '%s'", channel_name, group)
-        return "", group
+        return "", group, ""
 
     @staticmethod
     def _channel_sort_key(
@@ -727,13 +738,13 @@ class GenM3U:
         epg_index = self._build_epg_index(epg_channels)
         log.info("EPG 索引: %d 个条目", len(epg_index))
 
-        # 预处理: 为每个频道计算 display_name、group、URL
-        entries: list[tuple[str, str, str, str, str, IPTVChannel]] = []
+        # 预处理: 为每个频道计算 display_name、group、URL、epg_id
+        entries: list[tuple[str, str, str, str, str, str, IPTVChannel]] = []
         for channel in channels:
             base_name, _quality = _normalize_name(channel.channel_name)
             display_name = base_name
 
-            tvg_logo, group_title = self._match_channel(
+            tvg_logo, group_title, epg_id = self._match_channel(
                 base_name, channel.channel_name, epg_index,
             )
 
@@ -751,63 +762,114 @@ class GenM3U:
             if channel.fcc_enable and channel.fcc_ip:
                 http_url += f"?fcc={channel.fcc_ip}:{channel.fcc_port}&fcc-type=huawei"
 
-            entries.append((display_name, group_title, tvg_logo, http_url, channel.rtsp_url, channel))
+            entries.append(
+                (display_name, group_title, tvg_logo, http_url,
+                 channel.rtsp_url, epg_id, channel),
+            )
 
         # 排序: 分组顺序 → 组内自然排序
         entries.sort(key=lambda e: self._channel_sort_key(e[1], e[0]))
+
+        # 直播表头带节目单：x-tvg-url / url-tvg 双写以兼容不同播放器
+        #（Kodi IPTV Simple 认 x-tvg-url，部分播放器认 url-tvg）。
+        stream_header = (
+            f'#EXTM3U x-tvg-url="{self.epg_xmltv_url}" '
+            f'url-tvg="{self.epg_xmltv_url}"\n\n'
+        )
 
         with (
             open(self.m3u_stream_path, "w", encoding="utf-8-sig") as stream,
             open(self.m3u_playback_path, "w", encoding="utf-8-sig") as playback,
         ):
-            stream.write(M3U_HEADER)
+            stream.write(stream_header)
             playback.write(M3U_HEADER)
 
-            for display_name, group_title, tvg_logo, http_url, rtsp_url, channel in entries:
-                # catchup 属性（仅 RTSP URL 可用时添加）
+            for (display_name, group_title, tvg_logo, http_url,
+                 rtsp_url, epg_id, channel) in entries:
+                # tvg-id / tvg-name：优先 51zmt 频道码（绑定节目单），未命中回退。
+                # 51zmt XMLTV 的 <channel id> 是纯数字序号、<display-name> 才是码
+                #（CCTV1 / 湖南卫视…）；故 tvg-id 绑码靠播放器按 display-name 匹配，
+                # tvg-name 也对齐成同一个码以最大化命中，未命中则用运营商显示名。
+                tvg_id = epg_id or channel.user_channel_id
+                epg_name = epg_id or display_name
+
+                # catchup 回看：经 rtp2httpd 转 HTTP（/rtsp/ + playseek 时移），
+                # LAN 播放器无需直达运营商 RTSP 即可回看。仅 RTSP 源可转换时添加。
                 catchup_attrs = ""
-                if rtsp_url:
-                    catchup_source = f"{rtsp_url}&playseek={{utc:YmdHMS}}-{{utcend:YmdHMS}}"
+                catchup_http = self._rtsp_http_url(rtsp_url)
+                if catchup_http:
+                    catchup_source = (
+                        f"{catchup_http}&playseek={{utc:YmdHMS}}-{{utcend:YmdHMS}}"
+                    )
                     catchup_attrs = (
                         f'catchup="default" catchup-days="7" '
                         f'catchup-source="{catchup_source}" '
                     )
 
-                # 直播（HTTP 单播 + catchup 回看元数据）
+                # 直播（组播 + FCC 转 HTTP 单播 + catchup 回看元数据）
                 stream.write(
-                    f'#EXTINF:-1 tvg-id="{channel.user_channel_id}" '
-                    f'tvg-name="{display_name}" '
+                    f'#EXTINF:-1 tvg-id="{tvg_id}" '
+                    f'tvg-name="{epg_name}" '
                     f'tvg-logo="{tvg_logo}" group-title="{group_title}" '
                     f"{catchup_attrs},"
                     f"{display_name}\n"
                 )
                 stream.write(f"{http_url}\n\n")
 
-                # 回放（裸 RTSP，供 catchup 时移参考；直播兜底见末尾 📡RTSP备用 组）
+                # 回放（经 rtp2httpd 转 HTTP 的 RTSP；供 catchup 参考，LAN 可直接播。
+                # 直播兜底见末尾 RTSP直播 组、时移回看见 RTSP回看 组）
+                playback_url = self._rtsp_http_url(rtsp_url) or rtsp_url
                 playback.write(
                     f'#EXTINF:-1 tvg-id="{channel.user_channel_id}" '
                     f'tvg-name="{display_name}回放" '
                     f'tvg-logo="{tvg_logo}" group-title="{group_title}","'
                     f"{display_name}回放\n"
                 )
-                playback.write(f"{rtsp_url}\n\n")
+                playback.write(f"{playback_url}\n\n")
 
-            # ── RTSP 备用源（独立平铺分组，排在所有正常组之后）──
+            # ── RTSP直播（独立平铺分组，排在所有正常组之后）──
             # 范围 = 与组播主源完全相同的去重频道；每个有 rtsp_url 的频道一条，
-            # 主源有什么备用就有什么、一一对应、画质一致。
-            # URL 经 rtp2httpd 转 HTTP（非裸 rtsp://），播放器只需 HTTP、不必能到 IPTV 内网。
-            # 防播放端判重/折叠三重保证：独立分组 + 显示名带 [RTSP] + tvg-id 留空
-            #（代价：备用条目无 EPG 节目单，应急用可接受）。
-            for display_name, _group, tvg_logo, _http_url, rtsp_url, _channel in entries:
-                backup_url = self._rtsp_http_url(rtsp_url)
-                if not backup_url:
+            # 主源有什么备用就有什么、一一对应、画质一致。纯直播兜底：裸调
+            # /rtsp/（不带 playseek）即直播。URL 经 rtp2httpd 转 HTTP，播放器只需
+            # HTTP、不必能到 IPTV 内网。tvg-id 留空 → 零合并风险（TiviMate 等
+            # 不会按 id 把它折叠进主源），代价是此组无 EPG 节目单（应急用可接受）。
+            for (display_name, _group, tvg_logo, _http_url,
+                 rtsp_url, _epg_id, _channel) in entries:
+                live_url = self._rtsp_http_url(rtsp_url)
+                if not live_url:
                     continue
                 stream.write(
                     f'#EXTINF:-1 tvg-name="{display_name} [RTSP]" '
-                    f'tvg-logo="{tvg_logo}" group-title="📡RTSP备用",'
+                    f'tvg-logo="{tvg_logo}" group-title="RTSP直播",'
                     f"{display_name} [RTSP]\n"
                 )
-                stream.write(f"{backup_url}\n\n")
+                stream.write(f"{live_url}\n\n")
+
+            # ── RTSP回看（独立平铺分组，紧随 RTSP直播）──
+            # 与 RTSP直播 同源同范围，但带 catchup：直播主 URL 仍是裸 /rtsp/（直播），
+            # catchup-source 加 playseek 走 rtp2httpd 时移。tvg-id 绑节目单（= 主组播
+            # 同一 tvg-id），靠它从 EPG 选过去节目回看；显示名带 [回看] 后缀与主源/
+            # RTSP直播 区分。已知权衡：与主组播同 tvg-id，个别播放器可能按 id 合并到
+            # 同台（M3U 通病），靠 [回看] 后缀缓解。
+            for (display_name, _group, tvg_logo, _http_url,
+                 rtsp_url, epg_id, channel) in entries:
+                live_url = self._rtsp_http_url(rtsp_url)
+                if not live_url:
+                    continue
+                tvg_id = epg_id or channel.user_channel_id
+                epg_name = epg_id or display_name
+                catchup_source = (
+                    f"{live_url}&playseek={{utc:YmdHMS}}-{{utcend:YmdHMS}}"
+                )
+                stream.write(
+                    f'#EXTINF:-1 tvg-id="{tvg_id}" '
+                    f'tvg-name="{epg_name}" '
+                    f'tvg-logo="{tvg_logo}" group-title="RTSP回看" '
+                    f'catchup="default" catchup-days="7" '
+                    f'catchup-source="{catchup_source}",'
+                    f"{display_name} [回看]\n"
+                )
+                stream.write(f"{live_url}\n\n")
 
         log.info("M3U 直播文件已生成: %s", self.m3u_stream_path)
         log.info("M3U 回放文件已生成: %s", self.m3u_playback_path)

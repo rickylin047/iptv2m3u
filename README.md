@@ -9,10 +9,11 @@
 - 模拟机顶盒认证，获取频道列表
 - 频道名归一化（CCTV-{N} / CETV-{N} 统一）+ 去重：同名多版本保留最高画质、排除多数播放器不支持的 AVS2
 - 增量编码探测：直接解析 TS 流 PAT/PMT 判定 H.264/H.265/AVS2，结果缓存，已知频道跳过
-- EPG 多分类页抓取 + 精确匹配（频道 logo、分组）
+- EPG 多分类页抓取 + 精确匹配（频道 logo、分组、节目单 tvg-id）
 - 分组排序输出（央视 → 卫视 → 广东 → 数字付费 → …）
 - 生成带 FCC 快速换台参数和 catchup 回看属性的 M3U
-- 直播双源：组播 + FCC 为主源，另出一组经 rtp2httpd 转 HTTP 的 RTSP **备用源**（组播异常时兜底）
+- 节目单（EPG）：表头写入 `x-tvg-url` 指向 51zmt XMLTV，频道按 51zmt 频道码绑定，支持的播放器可显示节目表并从中选节目回看
+- 直播多源：组播 + FCC 为主源；另出 **RTSP直播**（组播异常时兜底）与 **RTSP回看**（时移回看，走 rtp2httpd + playseek）两组，均经 rtp2httpd 转 HTTP
 - 可配合 cron 定时更新（含黄金时段探测编码）
 
 ## 环境要求
@@ -82,16 +83,31 @@
 - **解耦稳定**：IPTV PPPoE 偶有重拨，独立后抖动不影响全家上网；主路由也无需具备 IPTV 能力，可任意品牌/固件。
 - **组播转单播的落点**：播放器大多不便直接收组播，由这台路由上的 `rtp2httpd` 统一转成 HTTP 单播下发，它天然就是“组播 → 单播”网关。
 
-## 直播源：组播主 / RTSP 备
+## 直播源：组播主源 + RTSP直播 / RTSP回看
 
-运营商对每个频道**同时下发两路源**：组播（`igmp://…`）与 RTSP 单播（`rtsp://…smil?accountinfo=…`）。本工具默认以**组播 + FCC 为主源**——换台最快、延迟最低；同时为每个频道再生成一条 **RTSP 备用源**，单独成组 `📡RTSP备用`。
+运营商对每个频道**同时下发两路源**：组播（`igmp://…`）与 RTSP 单播（`rtsp://…smil?accountinfo=…`）。本工具默认以**组播 + FCC 为主源**——换台最快、延迟最低；并把 RTSP 单播经 `rtp2httpd` 转成 HTTP 后，额外铺出 **RTSP直播** 与 **RTSP回看** 两组。
 
-- **主源（组播 + FCC）**：经 `rtp2httpd` 把组播转 HTTP 单播，FCC 秒级换台。依赖 IGMP 加组与 FCC 单播加速，链路相对“娇贵”（FCC 端口、上游 NAT 转发等都可能影响它）。
-- **备用源（RTSP）**：同样经 `rtp2httpd` 转 HTTP 单播（走 `/rtsp/` 路径），但走 **TCP 单播、不依赖 IGMP/FCC**，天然更稳；**无 FCC**、换台延迟略高。与主源**同频道、同画质**，仅作组播异常时的兜底。
+- **主源（组播 + FCC）**：经 `rtp2httpd` 把组播转 HTTP 单播，FCC 秒级换台。依赖 IGMP 加组与 FCC 单播加速，链路相对”娇贵”（FCC 端口、上游 NAT 转发等都可能影响它）。主源条目同时带 **catchup 回看属性**（见下）。
+- **`RTSP直播`（兜底）**：把运营商 RTSP 经 `rtp2httpd` 的 `/rtsp/` 转 HTTP 单播，走 **TCP 单播、不依赖 IGMP/FCC**，天然更稳；**无 FCC**、换台延迟略高。与主源**同频道、同画质**，仅作组播异常时的兜底。
+- **`RTSP回看`（时移）**：与 RTSP直播 同源同范围，但带 **catchup**——在 `/rtsp/` URL 末尾追加 `playseek=<开始>-<结束>`（UTC `YYYYMMDDHHMMSS`），由 `rtp2httpd` 翻译成对运营商 RTSP 的带 Range 时移播放。播放器从节目单里选过去的节目即触发回看。
 
-标准 M3U 不支持“一个频道两个 URL 自动 fallback”（各播放器行为不一、不通用），因此备用源**单独平铺成一组**：组播主源仍在各自原分组（央视 / 卫视 / 广东…），RTSP 备用全部集中到 `📡RTSP备用` 一组、显示名带 `[RTSP]` 后缀。组播频道黑屏时，切到该组的同名频道即可继续看。
+> **关键：回看也走 `rtp2httpd`**（`http://…:5140/rtsp/…&playseek=…`），不再是裸 `rtsp://运营商`。这样**家里 LAN 的播放器无需直达运营商 IPTV 内网**即可回看——主组播条目的 `catchup-source` 与 `RTSP回看` 组都用这条转发路径。
 
-> 备用条目刻意**不写 `tvg-id`**，避免被 TiviMate 等播放器按 id 与主源识别为同台而合并折叠；代价是备用源没有 EPG 节目单——应急观看可以接受。
+标准 M3U 不支持”一个频道两个 URL 自动 fallback”（各播放器行为不一、不通用），因此 RTSP 两组都**单独平铺**：组播主源仍在各自原分组（央视 / 卫视 / 广东…），`RTSP直播` 显示名带 `[RTSP]`、`RTSP回看` 带 `[回看]` 后缀。组播黑屏时切到 `RTSP直播` 同名频道；要时移就用 `RTSP回看`。
+
+> **分组与 `tvg-id` 取舍**：`RTSP直播` 刻意**不写 `tvg-id`** → 不会被 TiviMate 等按 id 与主源合并折叠（零合并风险），代价是该组无节目单。`RTSP回看` 需要节目单来选过去的节目，故**与主组播同 `tvg-id`**；个别播放器可能按 id 把两者并到同一台、令 “RTSP回看” 组名不单独显示（M3U 通病），靠显示名 `[回看]` 后缀缓解。
+
+> **回看依赖 `rtp2httpd` 的 playseek 透传**：需 `rtp2httpd` 支持把 `playseek` 翻译成 RTSP Range 时移（本仓部署的 3.8.x IPTV fork 已实测可用）。若你的 `rtp2httpd` 不支持 playseek，回看会退化（catchup 拉不到时移流）——此时可让 `catchup-source` 改回指向裸 `rtsp://` 由播放器自连运营商（但多数播放器不支持 RTSP catchup，且 LAN 到不了运营商内网，回看大概率仍不可用）。
+
+## 节目单 / EPG
+
+M3U 直播表头写入 `x-tvg-url`（同时写 `url-tvg` 以兼容不同播放器）指向 51zmt 的 XMLTV 节目单（默认 `http://epg.51zmt.top:8000/e.xml.gz`，可在 `config` 用 `epg_xmltv_url` 覆盖）。支持 EPG 的播放器（Kodi IPTV Simple、APTV 等）订阅后会自动拉取并显示节目表，并可**从节目单里选过去的节目做回看**。
+
+频道与节目单的绑定：每个频道的 `tvg-id` / `tvg-name` 写成 **51zmt 频道码**（如 `CCTV1`、`湖南卫视`），与 51zmt XMLTV 对齐。注意 51zmt XMLTV 的 `<channel id>` 是**数字序号**、`<display-name>` 才是频道码，故实际靠 **display-name 匹配**——这是 51zmt 生态的通行做法，绝大多数中文 IPTV 播放器都按此匹配。
+
+- 节目单由**播放器自行联网拉取**，本工具不生成 XMLTV（用 51zmt 现成的）。
+- 播放器需能访问公网（拉 `e.xml.gz`）；频道台标同样来自 51zmt。
+- 若某频道节目表不显示：多为该频道名未对齐到 51zmt 频道码，或播放器不支持按 display-name 匹配。
 
 ## 适用边界 / 与同类项目
 
@@ -115,6 +131,16 @@ uv run generate_m3u.py --probe    # 同时探测编码（较慢）
 ```
 
 生成的 M3U 写入 `config.yaml` 里的 `output_dir`（默认 `/www`，配合 uhttpd 等可直接 HTTP 订阅）。
+
+## 通过 HTTP 订阅
+
+`output_dir` 默认写到 iStoreOS **uhttpd 自带的 `/www`** web 根——uhttpd 本就在跑，**无需另装 nginx**，写进去即可直接 HTTP 订阅。在播放器里填以下任一地址（IP 换成你 IPTV 路由的 LAN IP）：
+
+| 订阅地址 | 说明 |
+|---------|------|
+| `http://192.168.50.8/iptv.m3u` | 直播表（组播主源 + RTSP直播 + RTSP回看 + 节目单），**日常用这个** |
+| `http://192.168.50.8/iptv_playback.m3u` | 纯回放表（每频道一条，经 rtp2httpd 转 HTTP；向后兼容保留） |
+| `http://192.168.50.8:5140/playlist.m3u` | `rtp2httpd` 自带的二次转换播放列表（由它读取 `/www/iptv.m3u` 生成） |
 
 ## 获取认证信息
 
@@ -144,7 +170,7 @@ uv run generate_m3u.py --probe    # 同时探测编码（较慢）
 
 ## 播放器
 
-生成的 M3U 兼容 VLC、PotPlayer、Kodi（PVR IPTV Simple Client）、APTV 等。直播经 rtp2httpd 转 HTTP 单播 + FCC 秒切；支持 catchup 的播放器可回看时移。
+生成的 M3U 兼容 VLC、PotPlayer、Kodi（PVR IPTV Simple Client）、APTV 等。直播经 rtp2httpd 转 HTTP 单播 + FCC 秒切；支持 EPG 的播放器会显示节目单，支持 catchup 的播放器可**从节目单选过去的节目回看**（回看流走 rtp2httpd + playseek 时移）。
 
 ## 定时更新
 
