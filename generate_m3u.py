@@ -358,7 +358,12 @@ class GenM3U:
             raise ValueError("配置文件为空")
 
         self.epg_urls: list[dict[str, str]] = cfg["epg_urls"]
-        self.unicast_url: str = cfg["unicast_url"]
+        self.unicast_url: str = cfg["unicast_url"]                       # .../rtp/
+        # RTSP 直播备用源 relay 基址：默认把 unicast_url 末段 rtp/ 换成 rtsp/
+        # （同一 rtp2httpd 服务）。可在 config 显式覆盖 rtsp_url，默认无需配置。
+        self.rtsp_base: str = cfg.get("rtsp_url") or (
+            self.unicast_url.rstrip("/").rsplit("/", 1)[0] + "/rtsp/"
+        )
         self.cache_dir: str = cfg.get("cache_dir", "cache")
         self.output_dir: str = cfg.get("output_dir", "output")
 
@@ -700,6 +705,16 @@ class GenM3U:
 
         return (group_idx, 999, display_name)
 
+    def _rtsp_http_url(self, rtsp_url: str) -> str:
+        """RTSP 源经 rtp2httpd 转 HTTP 单播：剥 rtsp:// 接到 /rtsp/ 基址后。
+
+        rtsp://host/path?query → {rtsp_base}host/path?query
+        完整 query（含 accountinfo 等鉴权尾巴）原样透传即可生效；RTSP 不加 FCC。
+        """
+        if not rtsp_url.startswith("rtsp://"):
+            return ""
+        return f"{self.rtsp_base}{rtsp_url[7:]}"
+
     def _generate_m3u(
         self,
         channels: list[IPTVChannel],
@@ -768,7 +783,7 @@ class GenM3U:
                 )
                 stream.write(f"{http_url}\n\n")
 
-                # 回放（RTSP — 仅供参考，客户端应使用 rtp2httpd /playlist.m3u）
+                # 回放（裸 RTSP，供 catchup 时移参考；直播兜底见末尾 📡RTSP备用 组）
                 playback.write(
                     f'#EXTINF:-1 tvg-id="{channel.user_channel_id}" '
                     f'tvg-name="{display_name}回放" '
@@ -776,6 +791,23 @@ class GenM3U:
                     f"{display_name}回放\n"
                 )
                 playback.write(f"{rtsp_url}\n\n")
+
+            # ── RTSP 备用源（独立平铺分组，排在所有正常组之后）──
+            # 范围 = 与组播主源完全相同的去重频道；每个有 rtsp_url 的频道一条，
+            # 主源有什么备用就有什么、一一对应、画质一致。
+            # URL 经 rtp2httpd 转 HTTP（非裸 rtsp://），播放器只需 HTTP、不必能到 IPTV 内网。
+            # 防播放端判重/折叠三重保证：独立分组 + 显示名带 [RTSP] + tvg-id 留空
+            #（代价：备用条目无 EPG 节目单，应急用可接受）。
+            for display_name, _group, tvg_logo, _http_url, rtsp_url, _channel in entries:
+                backup_url = self._rtsp_http_url(rtsp_url)
+                if not backup_url:
+                    continue
+                stream.write(
+                    f'#EXTINF:-1 tvg-name="{display_name} [RTSP]" '
+                    f'tvg-logo="{tvg_logo}" group-title="📡RTSP备用",'
+                    f"{display_name} [RTSP]\n"
+                )
+                stream.write(f"{backup_url}\n\n")
 
         log.info("M3U 直播文件已生成: %s", self.m3u_stream_path)
         log.info("M3U 回放文件已生成: %s", self.m3u_playback_path)

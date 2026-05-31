@@ -18,6 +18,11 @@ epg_urls:
 # rtp2httpd 服务地址（IGMP 转 HTTP 单播，支持 FCC 快速换台）
 unicast_url: "http://192.168.50.8:5140/rtp/"
 
+# RTSP 直播备用源的 relay 基址（同一 rtp2httpd 的 /rtsp/ 路径，TCP 单播、不依赖 IGMP/FCC）。
+# 默认从 unicast_url 自动派生（把末段 rtp/ 换成 rtsp/），一般无需配置；
+# 如需自定义可取消下一行注释覆盖：
+# rtsp_url: "http://192.168.50.8:5140/rtsp/"
+
 # 缓存目录
 cache_dir: "cache"
 

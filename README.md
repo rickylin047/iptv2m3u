@@ -12,6 +12,7 @@
 - EPG 多分类页抓取 + 精确匹配（频道 logo、分组）
 - 分组排序输出（央视 → 卫视 → 广东 → 数字付费 → …）
 - 生成带 FCC 快速换台参数和 catchup 回看属性的 M3U
+- 直播双源：组播 + FCC 为主源，另出一组经 rtp2httpd 转 HTTP 的 RTSP **备用源**（组播异常时兜底）
 - 可配合 cron 定时更新（含黄金时段探测编码）
 
 ## 环境要求
@@ -81,6 +82,23 @@
 - **解耦稳定**：IPTV PPPoE 偶有重拨，独立后抖动不影响全家上网；主路由也无需具备 IPTV 能力，可任意品牌/固件。
 - **组播转单播的落点**：播放器大多不便直接收组播，由这台路由上的 `rtp2httpd` 统一转成 HTTP 单播下发，它天然就是“组播 → 单播”网关。
 
+## 直播源：组播主 / RTSP 备
+
+运营商对每个频道**同时下发两路源**：组播（`igmp://…`）与 RTSP 单播（`rtsp://…smil?accountinfo=…`）。本工具默认以**组播 + FCC 为主源**——换台最快、延迟最低；同时为每个频道再生成一条 **RTSP 备用源**，单独成组 `📡RTSP备用`。
+
+- **主源（组播 + FCC）**：经 `rtp2httpd` 把组播转 HTTP 单播，FCC 秒级换台。依赖 IGMP 加组与 FCC 单播加速，链路相对“娇贵”（FCC 端口、上游 NAT 转发等都可能影响它）。
+- **备用源（RTSP）**：同样经 `rtp2httpd` 转 HTTP 单播（走 `/rtsp/` 路径），但走 **TCP 单播、不依赖 IGMP/FCC**，天然更稳；**无 FCC**、换台延迟略高。与主源**同频道、同画质**，仅作组播异常时的兜底。
+
+标准 M3U 不支持“一个频道两个 URL 自动 fallback”（各播放器行为不一、不通用），因此备用源**单独平铺成一组**：组播主源仍在各自原分组（央视 / 卫视 / 广东…），RTSP 备用全部集中到 `📡RTSP备用` 一组、显示名带 `[RTSP]` 后缀。组播频道黑屏时，切到该组的同名频道即可继续看。
+
+> 备用条目刻意**不写 `tvg-id`**，避免被 TiviMate 等播放器按 id 与主源识别为同台而合并折叠；代价是备用源没有 EPG 节目单——应急观看可以接受。
+
+## 适用边界 / 与同类项目
+
+本项目针对**组播 + FCC 平台**（广东电信华为平台），产出**带编码探测 + EPG 匹配 + RTSP 备用**的成品 M3U，强调“开箱即用、主源秒切、组播挂了有兜底”。
+
+如果你的线路**本就没有组播、只有 RTSP**（部分地区 / 平台已是纯单播），就用不到 FCC 与组播代理，可参考 [`yujincheng08/rust-iptv-proxy`](https://github.com/yujincheng08/rust-iptv-proxy)（AGPL-3.0，同为广东 IPTV）等“直接代理 RTSP”的思路。本项目的 RTSP 备用分支借鉴了“RTSP 也能作直播源”这一公开协议思路，但**全部自行实现、未引用其代码**。
+
 ## 快速开始
 
 ```bash
@@ -126,7 +144,7 @@ uv run generate_m3u.py --probe    # 同时探测编码（较慢）
 
 ## 播放器
 
-生成的 M3U 兼容 VLC、PotPlayer、TiviMate、Kodi（PVR IPTV Simple Client）、APTV 等。直播经 rtp2httpd 转 HTTP 单播 + FCC 秒切；支持 catchup 的播放器可回看时移。
+生成的 M3U 兼容 VLC、PotPlayer、Kodi（PVR IPTV Simple Client）、APTV 等。直播经 rtp2httpd 转 HTTP 单播 + FCC 秒切；支持 catchup 的播放器可回看时移。
 
 ## 定时更新
 
@@ -147,5 +165,5 @@ uv run generate_m3u.py --probe    # 同时探测编码（较慢）
 
 ## 许可证
 
-[MIT](./LICENSE)
+[AGPL-3.0](./LICENSE)。本项目以 AGPL-3.0 开源；若你修改本项目并**通过网络对外提供服务**，亦须向使用者提供相应（含改动）源码。
 </content>

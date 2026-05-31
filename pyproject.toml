@@ -4,11 +4,11 @@ version = "1.0.0"
 description = "从运营商 IPTV 系统提取频道列表，自动匹配 EPG 数据，生成标准 M3U 播放文件"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { text = "MIT" }
+license = { text = "AGPL-3.0-or-later" }
 keywords = ["iptv", "m3u", "epg", "playlist"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
 ]
