@@ -15,13 +15,17 @@
   #     python tests/test_rtsp_catchup.py
 """
 
+import gzip
 import os
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from generate_m3u import EPGChannel, GenM3U, IPTVChannel  # noqa: E402
+from generate_m3u import (  # noqa: E402
+    EPGChannel, GenM3U, IPTVChannel, _ms_to_xmltv,
+)
 
 RTSP_BASE = "http://192.168.50.8:5140/rtsp/"
 EPG_XMLTV = "http://epg.51zmt.top:8000/e.xml.gz"
@@ -30,7 +34,7 @@ SAMPLE_RTSP = (
     "rtsp://125.88.55.199/PLTV/88888888/224/3221225618/index.smil"
     "?accountinfo=FAKEAUTH0123456789ABCDEF"
 )
-PLAYSEEK_SUFFIX = "&playseek={utc:YmdHMS}-{utcend:YmdHMS}"
+PLAYSEEK_SUFFIX = "&playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
 
 
 def _gen() -> GenM3U:
@@ -77,9 +81,9 @@ def test_catchup_source_assembly():
     assert "?accountinfo=" in catchup_source and "&playseek=" in catchup_source
     # accountinfo 在 playseek 之前（鉴权串没有被 playseek 截断/挤掉）
     assert catchup_source.index("accountinfo=") < catchup_source.index("&playseek=")
-    # 模板占位符按字面保留（由播放器替换为实际 UTC 时间，不能被提前格式化）
-    assert "{utc:YmdHMS}" in catchup_source
-    assert "{utcend:YmdHMS}" in catchup_source
+    # 模板占位符按字面保留（由播放器替换为实际本地时间，不能被提前格式化）
+    assert "${(b)yyyyMMddHHmmss}" in catchup_source
+    assert "${(e)yyyyMMddHHmmss}" in catchup_source
 
 
 def _gen_full(output_dir: str) -> GenM3U:
@@ -147,7 +151,7 @@ def test_generate_m3u_structure():
     ) in m3u
     assert ('catchup-source="http://192.168.50.8:5140/rtsp/125.88.55.199/'
             "PLTV/88888888/224/3221225618/index.smil?accountinfo="
-            "FAKEAUTH0123456789ABCDEF&playseek={utc:YmdHMS}-{utcend:YmdHMS}\"") in m3u
+            "FAKEAUTH0123456789ABCDEF&playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}\"") in m3u
 
     # ③ CCTV-2 无 RTSP：主源在、tvg-id=CCTV2、但该条无 catchup-source
     assert 'tvg-id="CCTV2"' in m3u
@@ -170,11 +174,213 @@ def test_generate_m3u_structure():
     assert 'tvg-name="CCTV1"' in catchup_grp[0]  # tvg-name 对齐 51zmt 码以绑节目单
     assert "CCTV-1 [回看]" in catchup_grp[0]      # 可见名带 [回看] 后缀
     assert "catchup-source=" in catchup_grp[0]
-    assert "&playseek={utc:YmdHMS}-{utcend:YmdHMS}" in catchup_grp[0]
+    assert "&playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}" in catchup_grp[0]
 
     # ⑥ 回放文件 URL 已从裸 rtsp:// 转成 rtp2httpd /rtsp/（LAN 可用）
     assert "rtsp://" not in playback
     assert "http://192.168.50.8:5140/rtsp/125.88.55.199/" in playback
+
+
+def test_rewrite_epg_xmltv():
+    """_rewrite_epg_xmltv: 数字 channel id → display-name，自托管 URL 更新。"""
+    # 构造最小 XMLTV（2 channel + 2 programme，用数字 id）
+    xmltv = b"""<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="1">
+    <display-name>CCTV1</display-name>
+  </channel>
+  <channel id="27">
+    <display-name>\xe6\xb9\x96\xe5\x8d\x97\xe5\x8d\xab\xe8\xa7\x86</display-name>
+  </channel>
+  <programme start="20260531200000 +0800" stop="20260531210000 +0800" channel="1">
+    <title>\xe6\x96\xb0\xe9\x97\xbb\xe8\x81\x94\xe6\x92\xad</title>
+  </programme>
+  <programme start="20260531200000 +0800" stop="20260531213000 +0800" channel="27">
+    <title>\xe5\xbf\xab\xe4\xb9\x90\xe5\xa4\xa7\xe6\x9c\xac\xe8\x90\xa5</title>
+  </programme>
+</tv>"""
+    raw_gz = gzip.compress(xmltv)
+
+    with tempfile.TemporaryDirectory() as d:
+        cache_dir = os.path.join(d, "cache")
+        output_dir = os.path.join(d, "output")
+        os.makedirs(cache_dir)
+        os.makedirs(output_dir)
+
+        # 预置 cache（模拟下载失败时的 fallback）
+        cache_path = os.path.join(cache_dir, "epg_xmltv_raw.gz")
+        with open(cache_path, "wb") as f:
+            f.write(raw_gz)
+
+        # 构造 GenM3U（绕过 __init__）
+        g = GenM3U.__new__(GenM3U)
+        g.epg_xmltv_url = "http://will-fail.invalid/e.xml.gz"
+        g.epg_xmltv_cache = cache_path
+        g.epg_xmltv_path = os.path.join(output_dir, "epg.xml.gz")
+        g.unicast_url = "http://192.168.50.8:5140/rtp/"
+        g.output_dir = output_dir
+        g.cache_dir = cache_dir
+
+        g._rewrite_epg_xmltv()
+
+        # 断言：输出文件存在且 gzip 可解
+        assert os.path.exists(g.epg_xmltv_path), "epg.xml.gz 未生成"
+        with open(g.epg_xmltv_path, "rb") as f:
+            out_gz = f.read()
+        out_xml = gzip.decompress(out_gz)
+        root = ET.fromstring(out_xml)
+
+        # 断言：channel id 已重写为 display-name
+        ch_ids = {ch.get("id") for ch in root.findall("channel")}
+        assert "CCTV1" in ch_ids, f"缺少 CCTV1, got {ch_ids}"
+        assert "湖南卫视" in ch_ids, f"缺少 湖南卫视, got {ch_ids}"
+        assert "1" not in ch_ids, f"数字 id '1' 不应存在, got {ch_ids}"
+        assert "27" not in ch_ids, f"数字 id '27' 不应存在, got {ch_ids}"
+
+        # 断言：programme channel 已重写
+        prog_chs = {p.get("channel") for p in root.findall("programme")}
+        assert "CCTV1" in prog_chs, f"programme 缺少 CCTV1, got {prog_chs}"
+        assert "湖南卫视" in prog_chs, f"programme 缺少 湖南卫视, got {prog_chs}"
+
+        # 断言：self.epg_xmltv_url 更新为自托管
+        assert g.epg_xmltv_url == "http://192.168.50.8/epg.xml.gz", g.epg_xmltv_url
+
+
+def test_ms_to_xmltv():
+    """_ms_to_xmltv: UTC epoch 毫秒 → XMLTV 时间戳 (CST +0800)。"""
+    # 2026-05-31 20:00:00 CST = 2026-05-31 12:00:00 UTC = 1780228800 s
+    ms = 1780228800 * 1000
+    assert _ms_to_xmltv(ms) == "20260531200000 +0800", _ms_to_xmltv(ms)
+    # 2026-06-01 00:30:00 CST
+    ms2 = (1780228800 + 4 * 3600 + 30 * 60) * 1000
+    assert _ms_to_xmltv(ms2) == "20260601003000 +0800", _ms_to_xmltv(ms2)
+
+
+def _mock_session(responses: dict[str, dict]):
+    """构造一个 mock session，其 .get() 按 channelId 返回预置 JSON。"""
+    class MockResp:
+        def __init__(self, data):
+            self._data = data
+        def json(self):
+            return self._data
+
+    class MockSession:
+        def get(self, url, params=None, timeout=None):
+            cid = str(params.get("channelId", "")) if params else ""
+            data = responses.get(cid, {"playbillCount": 0, "playbillLites": []})
+            return MockResp(data)
+
+    return MockSession()
+
+
+def test_fetch_playbill_xmltv():
+    """_fetch_playbill_xmltv: 运营商节目单 → XMLTV，有数据/无数据频道均正确处理。"""
+    ch1 = IPTVChannel(
+        channel_id="6718", channel_name="CCTV-1综合高清",
+        user_channel_id="101",
+        igmp_url="igmp://239.3.1.1:8000", rtsp_url="",
+    )
+    ch2 = IPTVChannel(
+        channel_id="9999", channel_name="河源综合高清",
+        user_channel_id="501",
+        igmp_url="igmp://239.3.1.99:8000", rtsp_url="",
+    )
+    epg = [
+        EPGChannel(tvg_name="CCTV1", tvg_logo="http://logo/cctv1", group_title="央视"),
+    ]
+
+    pb_data = {
+        "6718": {
+            "playbillCount": 2,
+            "playbillLites": [
+                {"startTime": 1780228800000, "endTime": 1780232400000, "name": "新闻联播", "ID": "1"},
+                {"startTime": 1780232400000, "endTime": 1780236000000, "name": "焦点访谈", "ID": "2"},
+            ],
+        },
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+        g = GenM3U.__new__(GenM3U)
+        g.unicast_url = "http://192.168.50.8:5140/rtp/"
+        g.output_dir = d
+        g.epg_xmltv_path = os.path.join(d, "epg.xml.gz")
+        g.epg_xmltv_url = "http://epg.51zmt.top:8000/e.xml.gz"
+        g.session = _mock_session(pb_data)
+
+        ok = g._fetch_playbill_xmltv(
+            [ch1, ch2], [ch1, ch2], epg,
+        )
+
+        assert ok, "应返回 True（至少 1 个频道有数据）"
+        assert os.path.exists(g.epg_xmltv_path), "epg.xml.gz 未生成"
+
+        with open(g.epg_xmltv_path, "rb") as f:
+            xml_bytes = gzip.decompress(f.read())
+        root = ET.fromstring(xml_bytes)
+
+        ch_ids = {c.get("id") for c in root.findall("channel")}
+        assert "CCTV1" in ch_ids, f"缺少 CCTV1, got {ch_ids}"
+        assert "501" in ch_ids, f"缺少 501 (河源 fallback), got {ch_ids}"
+
+        progs = root.findall("programme")
+        cctv1_progs = [p for p in progs if p.get("channel") == "CCTV1"]
+        assert len(cctv1_progs) == 2, f"CCTV1 应有 2 条节目, got {len(cctv1_progs)}"
+        assert cctv1_progs[0].get("start") == "20260531200000 +0800"
+        assert cctv1_progs[0].find("title").text == "新闻联播"
+
+        heyuan_progs = [p for p in progs if p.get("channel") == "501"]
+        assert len(heyuan_progs) == 0, "河源无数据应无 programme"
+
+        assert g.epg_xmltv_url == "http://192.168.50.8/epg.xml.gz", g.epg_xmltv_url
+
+
+def test_playbill_sibling_fallback():
+    """去重后频道 ID 无 playbill 数据，备选组中另一个 ID 有数据 → 成功。"""
+    # 去重后选中 10000145（高清），但它没有 playbill；同名组的 6718 有数据
+    ch_deduped = IPTVChannel(
+        channel_id="10000145", channel_name="CCTV-1综合高清",
+        user_channel_id="101",
+        igmp_url="igmp://239.3.1.1:8000", rtsp_url="",
+    )
+    ch_sibling = IPTVChannel(
+        channel_id="6718", channel_name="CCTV-1综合",
+        user_channel_id="102",
+        igmp_url="igmp://239.3.1.2:8000", rtsp_url="",
+    )
+    epg = [
+        EPGChannel(tvg_name="CCTV1", tvg_logo="", group_title="央视"),
+    ]
+
+    pb_data = {
+        "6718": {
+            "playbillCount": 1,
+            "playbillLites": [
+                {"startTime": 1780228800000, "endTime": 1780232400000, "name": "新闻联播", "ID": "1"},
+            ],
+        },
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+        g = GenM3U.__new__(GenM3U)
+        g.unicast_url = "http://192.168.50.8:5140/rtp/"
+        g.output_dir = d
+        g.epg_xmltv_path = os.path.join(d, "epg.xml.gz")
+        g.epg_xmltv_url = "http://epg.51zmt.top:8000/e.xml.gz"
+        g.session = _mock_session(pb_data)
+
+        ok = g._fetch_playbill_xmltv(
+            [ch_deduped], [ch_deduped, ch_sibling], epg,
+        )
+
+        assert ok, "备选 ID 有数据，应返回 True"
+
+        with open(g.epg_xmltv_path, "rb") as f:
+            xml_bytes = gzip.decompress(f.read())
+        root = ET.fromstring(xml_bytes)
+
+        progs = [p for p in root.findall("programme") if p.get("channel") == "CCTV1"]
+        assert len(progs) == 1, f"应有 1 条节目（来自备选 6718）, got {len(progs)}"
+        assert progs[0].find("title").text == "新闻联播"
 
 
 def _run_all():

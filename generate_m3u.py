@@ -3,15 +3,18 @@
 
 import argparse
 import csv
+import gzip
 import json
 import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime as dt, timedelta, timezone
 from difflib import SequenceMatcher, get_close_matches
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 import yaml
@@ -25,6 +28,11 @@ M3U_HEADER = "#EXTM3U\n\n"
 DEFAULT_GROUP_TITLE = "其他"
 AUTH_SERVER_URL = "http://125.88.80.45:8082/EPG/jsp/ValidAuthenticationHWCTC.jsp"
 CHANNEL_LIST_URL = "http://125.88.80.45:8082/EPG/jsp/getchannellistHWCTC.jsp"
+PLAYBILL_URL = (
+    "http://125.88.80.45:8082"
+    "/EPG/jsp/iptvsnmv3/en/play/ajax/_ajax_getPlaybillList.jsp"
+)
+PLAYBILL_DAYS = 7
 
 # TS stream type → 编码名称
 STREAM_TYPE_NAMES = {
@@ -49,6 +57,13 @@ CHANNEL_PATTERN = re.compile(
 _CCTV_RE = re.compile(r"^CCTV-?(\d{1,2})(?![Kk])([＋+])?")
 
 log = logging.getLogger(__name__)
+
+_CST = timezone(timedelta(hours=8))
+
+
+def _ms_to_xmltv(ms: int) -> str:
+    """UTC epoch 毫秒 → XMLTV 时间戳 (YYYYMMDDHHMMSS +0800)。"""
+    return dt.fromtimestamp(ms / 1000, tz=_CST).strftime("%Y%m%d%H%M%S +0800")
 
 
 def _similarity(a: str, b: str) -> float:
@@ -402,16 +417,20 @@ class GenM3U:
         self.mapping_csv_path = os.path.join(self.output_dir, "channel_data.csv")
         self.m3u_stream_path = os.path.join(self.output_dir, "iptv.m3u")
         self.m3u_playback_path = os.path.join(self.output_dir, "iptv_playback.m3u")
+        self.epg_xmltv_path = os.path.join(self.output_dir, "epg.xml.gz")
+        self.epg_xmltv_cache = os.path.join(self.cache_dir, "epg_xmltv_raw.gz")
 
     def generate(self, do_probe: bool = False) -> None:
         """主流程：认证 → 解析 → (探测编码) → 去重 → EPG → 匹配 → 生成。"""
         self._authenticate()
-        channels = self._parse_channels()
+        all_channels = self._parse_channels()
         if do_probe:
-            probe_codecs(channels, self.unicast_url, self.codec_cache_path)
+            probe_codecs(all_channels, self.unicast_url, self.codec_cache_path)
         codec_map = self._load_codec_cache()
-        channels = self._dedup_channels(channels, codec_map)
+        channels = self._dedup_channels(all_channels, codec_map)
         epg_channels = self._fetch_and_parse_epg()
+        if not self._fetch_playbill_xmltv(channels, all_channels, epg_channels):
+            self._rewrite_epg_xmltv()
         self._generate_m3u(channels, epg_channels, codec_map)
 
     def _load_codec_cache(self) -> dict[str, dict[str, str]]:
@@ -477,11 +496,11 @@ class GenM3U:
         """认证 IPTV 服务器，获取频道数据。"""
         os.makedirs(self.cache_dir, exist_ok=True)
 
-        session = requests.Session()
+        self.session = requests.Session()
 
         # 第一步：POST 认证，获取 cookie（Session 自动管理）
         log.info("正在认证 IPTV 服务器...")
-        session.post(
+        self.session.post(
             AUTH_SERVER_URL,
             data=self._auth_form_data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -493,7 +512,7 @@ class GenM3U:
 
         # 第二步：GET 频道列表（Session 自动带 cookie）
         log.info("正在获取频道信息...")
-        response = session.get(CHANNEL_LIST_URL, timeout=REQUEST_TIMEOUT)
+        response = self.session.get(CHANNEL_LIST_URL, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
 
         with open(self.res_html_path, "w", encoding="utf-8-sig") as f:
@@ -726,6 +745,179 @@ class GenM3U:
             return ""
         return f"{self.rtsp_base}{rtsp_url[7:]}"
 
+    def _rewrite_epg_xmltv(self) -> None:
+        """下载 51zmt XMLTV，把 <channel id> 从数字序号重写为 display-name（频道码）。
+
+        重写后 gzip 压缩写到 output_dir/epg.xml.gz，更新 self.epg_xmltv_url
+        为自托管地址，使 M3U 表头 x-tvg-url 指向本地版本。
+        """
+        os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # ── 下载原始 XMLTV ──
+        raw_gz = None
+        try:
+            resp = requests.get(self.epg_xmltv_url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            raw_gz = resp.content
+            with open(self.epg_xmltv_cache, "wb") as f:
+                f.write(raw_gz)
+            log.info("EPG XMLTV 已下载: %s (%d bytes)", self.epg_xmltv_url, len(raw_gz))
+        except (requests.RequestException, OSError) as e:
+            log.warning("EPG XMLTV 下载失败: %s", e)
+            if os.path.exists(self.epg_xmltv_cache):
+                log.info("  使用缓存: %s", self.epg_xmltv_cache)
+                with open(self.epg_xmltv_cache, "rb") as f:
+                    raw_gz = f.read()
+            else:
+                log.warning("  无缓存可用，跳过 XMLTV 重写（保留远程 URL）")
+                return
+
+        # ── 解压 + 解析 ──
+        xml_bytes = gzip.decompress(raw_gz)
+        root = ET.fromstring(xml_bytes)
+
+        # ── 构建 old_id → display_name 映射 ──
+        mapping: dict[str, str] = {}
+        for ch_elem in root.findall("channel"):
+            old_id = ch_elem.get("id", "")
+            dn = ch_elem.find("display-name")
+            if dn is not None and dn.text:
+                mapping[old_id] = dn.text.strip()
+
+        # ── 重写 channel id ──
+        for ch_elem in root.findall("channel"):
+            old_id = ch_elem.get("id", "")
+            if old_id in mapping:
+                ch_elem.set("id", mapping[old_id])
+
+        # ── 重写 programme channel ──
+        for prog in root.findall("programme"):
+            old_ch = prog.get("channel", "")
+            if old_ch in mapping:
+                prog.set("channel", mapping[old_ch])
+
+        # ── 序列化 + 压缩 + 写盘 ──
+        out_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        out_gz = gzip.compress(out_xml)
+        with open(self.epg_xmltv_path, "wb") as f:
+            f.write(out_gz)
+
+        # ── 自托管 URL ──
+        host = urlparse(self.unicast_url).hostname
+        self.epg_xmltv_url = f"http://{host}/epg.xml.gz"
+
+        log.info(
+            "EPG XMLTV 已重写: %d 个频道 id 映射, 写入 %s",
+            len(mapping), self.epg_xmltv_path,
+        )
+
+    def _fetch_playbill_xmltv(
+        self,
+        channels: list[IPTVChannel],
+        all_channels: list[IPTVChannel],
+        epg_channels: list[EPGChannel],
+    ) -> bool:
+        """从运营商 playbill API 获取节目单，生成 XMLTV。
+
+        返回 True 表示成功生成，False 表示应 fallback 到 _rewrite_epg_xmltv()。
+        """
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # ── 构建备选 ID 映射：频道名 → 所有 channel_id ──
+        sibling_ids: dict[str, list[str]] = {}
+        for ch in all_channels:
+            base, _ = _normalize_name(ch.channel_name)
+            sibling_ids.setdefault(base, []).append(ch.channel_id)
+
+        # ── 时间窗口：7 天回看 + 今日全天 ──
+        now = dt.now(tz=_CST)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        begin = today_start - timedelta(days=PLAYBILL_DAYS)
+        end = today_start + timedelta(days=1)
+        begin_ms = int(begin.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+
+        # ── EPG 索引（用于 _match_channel 复用同一匹配逻辑）──
+        epg_index = self._build_epg_index(epg_channels)
+
+        # ── XML 树 ──
+        root = ET.Element("tv")
+        seen_tvg_ids: set[str] = set()
+        channels_with_data = 0
+
+        for ch in channels:
+            base_name, _ = _normalize_name(ch.channel_name)
+            _, _, epg_id = self._match_channel(base_name, ch.channel_name, epg_index)
+            tvg_id = epg_id or ch.user_channel_id
+
+            if tvg_id in seen_tvg_ids:
+                continue
+            seen_tvg_ids.add(tvg_id)
+
+            # 候选 ID 列表：去重后频道自身 + 同名组备选
+            candidate_ids = [ch.channel_id]
+            for sid in sibling_ids.get(base_name, []):
+                if sid != ch.channel_id and sid not in candidate_ids:
+                    candidate_ids.append(sid)
+
+            # 逐个候选 ID 尝试拉 playbill
+            playbills = None
+            for cid in candidate_ids:
+                try:
+                    resp = self.session.get(
+                        PLAYBILL_URL,
+                        params={"channelId": cid, "begin": begin_ms, "end": end_ms},
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    data = resp.json()
+                    if data.get("playbillCount", 0) > 0:
+                        playbills = data["playbillLites"]
+                        break
+                except Exception as e:
+                    log.debug("playbill channelId=%s 失败: %s", cid, e)
+
+            # 添加 <channel>
+            ch_elem = ET.SubElement(root, "channel", id=tvg_id)
+            dn = ET.SubElement(ch_elem, "display-name")
+            dn.text = tvg_id
+
+            if playbills:
+                channels_with_data += 1
+                for pb in playbills:
+                    start_ms = pb.get("startTime") or pb.get("beginTime")
+                    stop_ms = pb.get("endTime")
+                    title = pb.get("name", "")
+                    if not start_ms or not stop_ms:
+                        continue
+                    prog = ET.SubElement(
+                        root, "programme",
+                        channel=tvg_id,
+                        start=_ms_to_xmltv(int(start_ms)),
+                        stop=_ms_to_xmltv(int(stop_ms)),
+                    )
+                    t = ET.SubElement(prog, "title")
+                    t.text = title
+
+        if channels_with_data == 0:
+            log.warning("运营商节目单: 0 个频道有数据，fallback 到 51zmt")
+            return False
+
+        # ── 序列化 + 压缩 + 写盘 ──
+        out_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        out_gz = gzip.compress(out_xml)
+        with open(self.epg_xmltv_path, "wb") as f:
+            f.write(out_gz)
+
+        host = urlparse(self.unicast_url).hostname
+        self.epg_xmltv_url = f"http://{host}/epg.xml.gz"
+
+        log.info(
+            "运营商节目单: %d/%d 频道有数据, 写入 %s",
+            channels_with_data, len(seen_tvg_ids), self.epg_xmltv_path,
+        )
+        return True
+
     def _generate_m3u(
         self,
         channels: list[IPTVChannel],
@@ -799,7 +991,7 @@ class GenM3U:
                 catchup_http = self._rtsp_http_url(rtsp_url)
                 if catchup_http:
                     catchup_source = (
-                        f"{catchup_http}&playseek={{utc:YmdHMS}}-{{utcend:YmdHMS}}"
+                        f"{catchup_http}&playseek=${{(b)yyyyMMddHHmmss}}-${{(e)yyyyMMddHHmmss}}"
                     )
                     catchup_attrs = (
                         f'catchup="default" catchup-days="7" '
@@ -859,7 +1051,7 @@ class GenM3U:
                 tvg_id = epg_id or channel.user_channel_id
                 epg_name = epg_id or display_name
                 catchup_source = (
-                    f"{live_url}&playseek={{utc:YmdHMS}}-{{utcend:YmdHMS}}"
+                    f"{live_url}&playseek=${{(b)yyyyMMddHHmmss}}-${{(e)yyyyMMddHHmmss}}"
                 )
                 stream.write(
                     f'#EXTINF:-1 tvg-id="{tvg_id}" '

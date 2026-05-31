@@ -101,13 +101,15 @@
 
 ## 节目单 / EPG
 
-M3U 直播表头写入 `x-tvg-url`（同时写 `url-tvg` 以兼容不同播放器）指向 51zmt 的 XMLTV 节目单（默认 `http://epg.51zmt.top:8000/e.xml.gz`，可在 `config` 用 `epg_xmltv_url` 覆盖）。支持 EPG 的播放器（Kodi IPTV Simple、APTV 等）订阅后会自动拉取并显示节目表，并可**从节目单里选过去的节目做回看**。
+节目单数据来自**运营商内网 playbill API**（与机顶盒同源），时间与实际播出完全一致，catchup playseek 回看不再有时间偏移。生成器认证后直接调用运营商 EPG 服务器的 playbill 接口，获取每个频道 7 天回看 + 当日全天的节目排期，转成 XMLTV 格式后 gzip 压缩写到输出目录（`/www/epg.xml.gz`）。M3U 表头的 `x-tvg-url`（同时写 `url-tvg` 以兼容不同播放器）指向自托管的这份运营商节目单。
 
-频道与节目单的绑定：每个频道的 `tvg-id` / `tvg-name` 写成 **51zmt 频道码**（如 `CCTV1`、`湖南卫视`），与 51zmt XMLTV 对齐。注意 51zmt XMLTV 的 `<channel id>` 是**数字序号**、`<display-name>` 才是频道码，故实际靠 **display-name 匹配**——这是 51zmt 生态的通行做法，绝大多数中文 IPTV 播放器都按此匹配。
+若运营商 API 完全不可用（认证失效、网络异常等），自动 fallback 到 51zmt XMLTV 重写版（下载 `e.xml.gz`，把 `<channel id>` 从数字序号重写为频道码）。
 
-- 节目单由**播放器自行联网拉取**，本工具不生成 XMLTV（用 51zmt 现成的）。
-- 播放器需能访问公网（拉 `e.xml.gz`）；频道台标同样来自 51zmt。
-- 若某频道节目表不显示：多为该频道名未对齐到 51zmt 频道码，或播放器不支持按 display-name 匹配。
+频道与节目单的绑定：每个频道的 `tvg-id` / `tvg-name` 写成 **51zmt 频道码**（如 `CCTV1`、`湖南卫视`），与 XMLTV `<channel id>` 精确匹配。支持 EPG 的播放器（Kodi IPTV Simple、APTV 等）订阅后会自动拉取并显示节目表，并可**从节目单里选过去的节目做回看**。
+
+- 节目单由生成器**自托管**（写入 `output_dir`，uhttpd 直接服务），播放器从 LAN 拉取，无需公网。
+- 频道台标来自 51zmt EPG 分类页。
+- 若某频道节目表不显示：多为该频道名未对齐到 51zmt 频道码。
 
 ## 适用边界 / 与同类项目
 
